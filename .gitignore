@@ -1,0 +1,13 @@
+﻿.env
+.venv/
+__pycache__/
+*.pyc
+
+# Local data and generated artifacts
+data/
+
+# Access/request evidence
+docs/evidencias_acceso/
+
+.DS_Store
+Thumbs.db
