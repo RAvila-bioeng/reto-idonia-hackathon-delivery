@@ -2,11 +2,14 @@ import argparse
 import base64
 import hashlib
 import hmac
+import io
 import json
 import os
 import re
+import shutil
 import time
 import unicodedata
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,14 +39,26 @@ VALIDATION_NOTE = (
 
 
 CASE_CONCEPT_VARIANTS = {
-    "rodilla": ["rodilla"],
-    "menisco": ["menisco", "meniscal"],
-    "ligamento": ["ligamento", "ligamentario", "ligamentaria"],
+    "rodilla": ["rodilla", "rodillas"],
+    "menisco": ["menisco", "meniscos", "meniscal"],
+    "ligamento": [
+        "ligamento",
+        "ligamentos",
+        "ligamentario",
+        "ligamentaria",
+    ],
     "edema": ["edema"],
-    "derrame": ["derrame", "liquido articular", "líquido articular"],
+    "derrame / liquido articular": [
+        "derrame",
+        "liquido",
+        "liquido articular",
+        "acumulacion de liquido",
+    ],
     "fisura / grieta": [
         "fisura",
+        "fisuras",
         "grieta",
+        "grietas",
         "fractura fina",
         "pequena fractura",
         "pequeña fractura",
@@ -51,7 +66,7 @@ CASE_CONCEPT_VARIANTS = {
         "línea de fractura",
     ],
     "fractura": ["fractura"],
-    "resonancia": ["resonancia", "rm", "mri"],
+    "resonancia": ["resonancia", "resonancia magnetica", "rm", "mri"],
     "seguimiento / control": ["seguimiento", "control", "revision", "revisión"],
 }
 
@@ -75,7 +90,6 @@ def parse_args():
     )
     parser.add_argument(
         "--report",
-        required=True,
         help="Path to the original report PDF.",
     )
     parser.add_argument(
@@ -94,7 +108,10 @@ def parse_args():
     )
     parser.add_argument(
         "--recog-cache",
-        help="Existing humanized PDF to reuse in cache mode without calling Recog.",
+        help=(
+            "Existing humanized PDF to reuse in cache or real mode without "
+            "calling Recog."
+        ),
     )
     parser.add_argument(
         "--confirm-external-calls",
@@ -115,6 +132,16 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--derive-idonia-context-from-dicom",
+        action="store_true",
+        help="Derive the shared Idonia patient/study route from DICOM tags.",
+    )
+    parser.add_argument(
+        "--print-idonia-context-only",
+        action="store_true",
+        help="Print the safe Idonia context summary without network or PDF work.",
+    )
+    parser.add_argument(
         "--show-access-details",
         action="store_true",
         help=(
@@ -127,16 +154,27 @@ def parse_args():
 
 def validate_execution_request(args):
     """Reject ambiguous or potentially costly execution requests."""
+    context_only = getattr(args, "print_idonia_context_only", False)
+    derive_context = getattr(args, "derive_idonia_context_from_dicom", False)
+    if not context_only and not getattr(args, "report", None):
+        raise RuntimeError("--report is required unless context-only mode is used.")
+    if context_only and not derive_context:
+        raise RuntimeError(
+            "--print-idonia-context-only requires "
+            "--derive-idonia-context-from-dicom."
+        )
+    if context_only:
+        return
     if args.mode == "cache" and not args.recog_cache:
         raise RuntimeError("Cache mode requires --recog-cache <path>.")
-    if args.mode != "cache" and args.recog_cache:
-        raise RuntimeError("--recog-cache can only be used with --mode cache.")
+    if args.mode == "mock" and args.recog_cache:
+        raise RuntimeError("--recog-cache can only be used with cache or real mode.")
     if args.mode == "real" and not args.confirm_external_calls:
         raise RuntimeError(
             "Real mode calls external APIs. Re-run with "
             "--confirm-external-calls after checking inputs and credentials."
         )
-    if args.mode == "real" and not args.confirm_recog_call:
+    if args.mode == "real" and not args.recog_cache and not args.confirm_recog_call:
         raise RuntimeError(
             "Recog consumes shared generative-AI resources. Re-run real mode "
             "with --confirm-recog-call to authorize this single call."
@@ -145,7 +183,7 @@ def validate_execution_request(args):
         raise RuntimeError("--show-access-details is only available in real mode.")
 
 
-def load_config():
+def load_config(require_recog=True):
     """Load the required Idonia and Recog settings from .env."""
     load_dotenv(override=True)
 
@@ -159,24 +197,28 @@ def load_config():
         "recog_api_key": os.getenv("RECOG_API_KEY"),
     }
 
-    missing = [
-        name
-        for name, value in (
-            ("IDONIA_BASE_URL", config["idonia_base_url"]),
-            ("IDONIA_API_KEY", config["idonia_api_key"]),
-            ("IDONIA_API_SECRET", config["idonia_api_secret"]),
-            ("IDONIA_REPORT_ENDPOINT", config["idonia_report_endpoint"]),
-            ("IDONIA_STUDY_ENDPOINT", config["idonia_study_endpoint"]),
-            ("RECOG_BASE_URL", config["recog_base_url"]),
-            ("RECOG_API_KEY", config["recog_api_key"]),
-        )
-        if not value
+    required_settings = [
+        ("IDONIA_BASE_URL", config["idonia_base_url"]),
+        ("IDONIA_API_KEY", config["idonia_api_key"]),
+        ("IDONIA_API_SECRET", config["idonia_api_secret"]),
+        ("IDONIA_REPORT_ENDPOINT", config["idonia_report_endpoint"]),
+        ("IDONIA_STUDY_ENDPOINT", config["idonia_study_endpoint"]),
     ]
+    if require_recog:
+        required_settings.extend(
+            [
+                ("RECOG_BASE_URL", config["recog_base_url"]),
+                ("RECOG_API_KEY", config["recog_api_key"]),
+            ]
+        )
+
+    missing = [name for name, value in required_settings if not value]
     if missing:
         raise RuntimeError("Missing environment variables: " + ", ".join(missing))
 
     config["idonia_base_url"] = config["idonia_base_url"].rstrip("/")
-    config["recog_base_url"] = config["recog_base_url"].rstrip("/")
+    if config["recog_base_url"]:
+        config["recog_base_url"] = config["recog_base_url"].rstrip("/")
     return config
 
 
@@ -221,7 +263,7 @@ def redact(value, config, token=None):
     replacements = [
         (config["idonia_api_key"], "[REDACTED_IDONIA_API_KEY]"),
         (config["idonia_api_secret"], "[REDACTED_IDONIA_API_SECRET]"),
-        (config["recog_api_key"], "[REDACTED_RECOG_API_KEY]"),
+        (config.get("recog_api_key"), "[REDACTED_RECOG_API_KEY]"),
         (token, "[REDACTED_JWT]"),
     ]
     for secret, label in replacements:
@@ -275,6 +317,11 @@ def has_patient_disclaimer(text):
         and "no sustituye la valoracion de un profesional sanitario" in normalized
         and "ni modifica el informe medico original" in normalized
     )
+
+
+def needs_patient_disclaimer(text):
+    """Return True only when the patient disclaimer is not already present."""
+    return not has_patient_disclaimer(text)
 
 
 def validate_humanized_report(original_text: str, humanized_text: str) -> dict:
@@ -333,7 +380,138 @@ def parse_returned_uuid(response):
     return str(body)[:PREVIEW_CHARS]
 
 
-def upload_to_idonia(config, token, file_path, endpoint, timeout_seconds):
+def build_idonia_context(dicom_tags=None):
+    """Build one shared Idonia route, with safe fallback for missing tags."""
+    derived_from_dicom = dicom_tags is not None
+    dicom_tags = dicom_tags or {}
+    values = {
+        "idonia_patient_id": (
+            str(dicom_tags.get("PatientID") or "").strip() or DICOM_PATIENT_ID
+        ),
+        "idonia_accession_number": (
+            str(dicom_tags.get("AccessionNumber") or "").strip()
+            or DICOM_ACCESSION_NUMBER
+        ),
+        "idonia_study_description": (
+            str(dicom_tags.get("StudyDescription") or "").strip()
+            or DICOM_STUDY_DESCRIPTION
+        ),
+    }
+    values["magic_link_route"] = (
+        f"{values['idonia_patient_id']}/{values['idonia_accession_number']}"
+    )
+    values["derived_from_dicom"] = derived_from_dicom
+    values["fallback_fields"] = (
+        [
+            field
+            for field, tag_name in (
+                ("idonia_patient_id", "PatientID"),
+                ("idonia_accession_number", "AccessionNumber"),
+                ("idonia_study_description", "StudyDescription"),
+            )
+            if not str(dicom_tags.get(tag_name) or "").strip()
+        ]
+        if derived_from_dicom
+        else []
+    )
+    return values
+
+
+def extract_dicom_tags(study_path):
+    """Read route tags from the first valid DICOM in a file or ZIP archive."""
+    try:
+        import pydicom
+    except ImportError as error:
+        raise RuntimeError(
+            "pydicom is required for --derive-idonia-context-from-dicom. "
+            "Install dependencies from requirements.txt."
+        ) from error
+
+    study_path = Path(study_path)
+    tag_names = ["PatientID", "AccessionNumber", "StudyDescription"]
+
+    def read_tags(source):
+        dataset = pydicom.dcmread(
+            source,
+            stop_before_pixels=True,
+            specific_tags=tag_names,
+        )
+        return {
+            tag_name: str(getattr(dataset, tag_name, "") or "").strip()
+            for tag_name in tag_names
+        }
+
+    if zipfile.is_zipfile(study_path):
+        with zipfile.ZipFile(study_path) as archive:
+            for member in archive.infolist():
+                if member.is_dir():
+                    continue
+                try:
+                    with archive.open(member) as dicom_file:
+                        return read_tags(io.BytesIO(dicom_file.read()))
+                except Exception:
+                    continue
+        raise RuntimeError("No valid DICOM file found in study ZIP.")
+
+    try:
+        return read_tags(study_path)
+    except Exception as error:
+        raise RuntimeError(f"Study file is not a valid DICOM: {study_path}") from error
+
+
+def build_safe_idonia_context_summary(idonia_context):
+    """Return route diagnostics without exposing DICOM-derived identifiers."""
+    if not idonia_context["derived_from_dicom"]:
+        return dict(idonia_context)
+    return {
+        "idonia_patient_id": "[derived from DICOM]",
+        "idonia_accession_number": "[derived from DICOM]",
+        "idonia_study_description": "[derived from DICOM]",
+        "magic_link_route": "[derived patient]/[derived accession]",
+        "derived_from_dicom": True,
+        "fallback_fields": list(idonia_context["fallback_fields"]),
+    }
+
+
+def print_idonia_context(idonia_context):
+    """Print a non-sensitive summary of the shared Idonia route."""
+    safe_context = build_safe_idonia_context_summary(idonia_context)
+    print("\nIdonia logical route")
+    print(f"idonia_patient_id: {safe_context['idonia_patient_id']}")
+    print(
+        "idonia_accession_number: "
+        f"{safe_context['idonia_accession_number']}"
+    )
+    print(
+        "idonia_study_description: "
+        f"{safe_context['idonia_study_description']}"
+    )
+    print(f"magic_link_route: {safe_context['magic_link_route']}")
+    print(
+        "context_source: "
+        + ("DICOM tags" if idonia_context["derived_from_dicom"] else "configured")
+    )
+    tag_names = {
+        "idonia_patient_id": "PatientID (0010,0020)",
+        "idonia_accession_number": "AccessionNumber (0008,0050)",
+        "idonia_study_description": "StudyDescription (0008,1030)",
+    }
+    for field in idonia_context["fallback_fields"]:
+        print(
+            f"[WARNING] DICOM tag {tag_names[field]} missing; "
+            f"fallback used for {field}."
+        )
+
+
+def upload_to_idonia(
+    config,
+    token,
+    file_path,
+    endpoint,
+    timeout_seconds,
+    idonia_context,
+    visible_filename=None,
+):
     """Upload one report or study file to an Idonia /files endpoint."""
     if not file_path.is_file():
         raise FileNotFoundError(f"Missing upload file: {file_path}")
@@ -341,9 +519,9 @@ def upload_to_idonia(config, token, file_path, endpoint, timeout_seconds):
     url = f"{config['idonia_base_url']}/files/{endpoint}"
     headers = {"Authorization": "Bearer " + token}
     data = {
-        "DICOMPatientID": DICOM_PATIENT_ID,
-        "DICOMAccessionNumber": DICOM_ACCESSION_NUMBER,
-        "DICOMStudyDescription": DICOM_STUDY_DESCRIPTION,
+        "DICOMPatientID": idonia_context["idonia_patient_id"],
+        "DICOMAccessionNumber": idonia_context["idonia_accession_number"],
+        "DICOMStudyDescription": idonia_context["idonia_study_description"],
     }
 
     try:
@@ -352,7 +530,7 @@ def upload_to_idonia(config, token, file_path, endpoint, timeout_seconds):
                 url,
                 headers=headers,
                 data=data,
-                files={"file": (file_path.name, upload_file)},
+                files={"file": (visible_filename or file_path.name, upload_file)},
                 timeout=timeout_seconds,
             )
     except requests.RequestException as error:
@@ -385,13 +563,19 @@ def build_raw_recog_output_path():
 
 
 def prepare_patient_report(source_path, output_path=None):
-    """Prepend a non-clinical disclaimer cover without editing generated content."""
+    """Ensure the patient report contains exactly one added disclaimer cover."""
     source_path = Path(source_path)
     if not source_path.is_file():
         raise FileNotFoundError(f"Missing humanized PDF: {source_path}")
 
     output_path = Path(output_path or build_recog_output_path())
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    source_text = extract_text_from_pdf(source_path)
+
+    if not needs_patient_disclaimer(source_text):
+        if source_path.resolve() != output_path.resolve():
+            shutil.copyfile(source_path, output_path)
+        return output_path
 
     with fitz.open() as final_document:
         cover = final_document.new_page()
@@ -405,7 +589,7 @@ def prepare_patient_report(source_path, output_path=None):
             final_document.insert_pdf(source_document)
         if output_path.exists():
             output_path.unlink()
-        final_document.save(output_path)
+        output_path.write_bytes(final_document.tobytes())
 
     return output_path
 
@@ -531,12 +715,11 @@ def should_upload_humanized_report(validation_result, allow_requires_review=Fals
     )
 
 
-def get_or_create_magic_link(config, token):
+def get_or_create_magic_link(config, token, idonia_context):
     """Retrieve an existing Magic Link, or create it when Idonia returns 204."""
     url = config["idonia_base_url"] + "/ml"
-    route = f"{DICOM_PATIENT_ID}/{DICOM_ACCESSION_NUMBER}"
     headers = {"Authorization": "Bearer " + token}
-    params = {"route": route}
+    params = {"route": idonia_context["magic_link_route"]}
 
     try:
         response = requests.get(
@@ -574,21 +757,31 @@ def main():
 
     args = parse_args()
     validate_execution_request(args)
-    report_path = Path(args.report)
     study_path = Path(args.study)
-    if not report_path.is_file():
-        raise FileNotFoundError(f"Missing report PDF: {report_path}")
     if not study_path.is_file():
         raise FileNotFoundError(f"Missing study file: {study_path}")
+
+    dicom_tags = (
+        extract_dicom_tags(study_path)
+        if getattr(args, "derive_idonia_context_from_dicom", False)
+        else None
+    )
+    idonia_context = build_idonia_context(dicom_tags)
+    print_idonia_context(idonia_context)
+    if getattr(args, "print_idonia_context_only", False):
+        return
+
+    report_path = Path(args.report)
+    if not report_path.is_file():
+        raise FileNotFoundError(f"Missing report PDF: {report_path}")
 
     extracted_text = extract_text_from_pdf(report_path)
     config = None
     token = None
     magic_url_or_code = ""
     magic_pin = ""
-
     if args.mode == "real":
-        config = load_config()
+        config = load_config(require_recog=not args.recog_cache)
         token = build_idonia_jwt(
             config["idonia_api_key"],
             config["idonia_api_secret"],
@@ -599,12 +792,16 @@ def main():
             report_path,
             config["idonia_report_endpoint"],
             PDF_TIMEOUT_SECONDS,
+            idonia_context,
         )
-        raw_recog_path = call_recog(config, extracted_text)
-        try:
-            recog_output_path = prepare_patient_report(raw_recog_path)
-        finally:
-            raw_recog_path.unlink(missing_ok=True)
+        if args.recog_cache:
+            recog_output_path = prepare_patient_report(Path(args.recog_cache))
+        else:
+            raw_recog_path = call_recog(config, extracted_text)
+            try:
+                recog_output_path = prepare_patient_report(raw_recog_path)
+            finally:
+                raw_recog_path.unlink(missing_ok=True)
     else:
         source_path = (
             Path(args.recog_cache)
@@ -655,6 +852,8 @@ def main():
                 recog_output_path,
                 config["idonia_report_endpoint"],
                 PDF_TIMEOUT_SECONDS,
+                idonia_context,
+                visible_filename=HUMANIZED_REPORT_FILENAME,
             )
         else:
             humanized_status = "blocked_requires_review"
@@ -666,8 +865,13 @@ def main():
             study_path,
             config["idonia_study_endpoint"],
             STUDY_TIMEOUT_SECONDS,
+            idonia_context,
         )
-        magic_url_or_code, magic_pin = get_or_create_magic_link(config, token)
+        magic_url_or_code, magic_pin = get_or_create_magic_link(
+            config,
+            token,
+            idonia_context,
+        )
     else:
         humanized_status = (
             "simulated"
@@ -684,19 +888,15 @@ def main():
         "run_id": run_id,
         "timestamp_utc": timestamp_utc,
         "mode": args.mode,
-        "case": {
-            "DICOMPatientID": DICOM_PATIENT_ID,
-            "DICOMAccessionNumber": DICOM_ACCESSION_NUMBER,
-            "DICOMStudyDescription": DICOM_STUDY_DESCRIPTION,
-        },
+        "case": build_safe_idonia_context_summary(idonia_context),
         "original_report": {
             "path": str(report_path),
             "upload_status": original_status,
             "uuid": original_uuid,
         },
         "recog": {
-            "api_called": args.mode == "real",
-            "cache_used": args.mode == "cache",
+            "api_called": args.mode == "real" and not args.recog_cache,
+            "cache_used": bool(args.recog_cache),
             "output_path": str(recog_output_path),
             "output_pdf_size_bytes": recog_output_path.stat().st_size,
         },
@@ -730,7 +930,7 @@ def main():
         secrets = (
             config["idonia_api_key"],
             config["idonia_api_secret"],
-            config["recog_api_key"],
+            config.get("recog_api_key"),
             token,
             magic_url_or_code,
             magic_pin,

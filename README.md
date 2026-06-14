@@ -74,6 +74,52 @@ python run_full_flow_minimal.py `
   --study "data\input\estudio_rm\Imágenes RM Rodilla.zip"
 ```
 
+### Idonia real con Recog cacheado
+
+Para una verificación final sin consumir de nuevo recursos de Recog, el modo
+real puede reutilizar un PDF humanizado. Se mantiene la confirmación de llamadas
+externas porque las operaciones con Idonia siguen siendo reales:
+
+```powershell
+python run_full_flow_minimal.py `
+  --mode real `
+  --confirm-external-calls `
+  --recog-cache "data\cache\recog_real_patient_report.pdf" `
+  --report "data\input\Informe_RM_RODILLA.pdf" `
+  --study "data\input\estudio_rm\Imágenes RM Rodilla.zip"
+```
+
+Esta combinación no llama a Recog ni requiere `--confirm-recog-call`. El PDF
+cacheado pasa por la misma validación clínica y el bloqueo por
+`requires_review` antes de cualquier subida del informe humanizado.
+
+### Diagnóstico de ruta DICOM sin red
+
+Lee `PatientID`, `AccessionNumber` y `StudyDescription` del primer DICOM válido
+del archivo o ZIP. No carga credenciales, genera PDFs ni realiza llamadas:
+
+```powershell
+python run_full_flow_minimal.py `
+  --print-idonia-context-only `
+  --derive-idonia-context-from-dicom `
+  --study "data\input\estudio_rm\Imágenes RM Rodilla.zip"
+```
+
+Los identificadores derivados se enmascaran en consola para no exponer PHI. Si
+falta un tag se indica el fallback utilizado sin imprimir el valor clínico.
+
+Para la ejecución final con Idonia real y Recog cacheado:
+
+```powershell
+python run_full_flow_minimal.py `
+  --mode real `
+  --confirm-external-calls `
+  --recog-cache "data\cache\recog_real_patient_report.pdf" `
+  --derive-idonia-context-from-dicom `
+  --report "data\input\Informe_RM_RODILLA.pdf" `
+  --study "data\input\estudio_rm\Imágenes RM Rodilla.zip"
+```
+
 No debe ejecutarse repetidamente para preparar el vídeo. Usa mock o cache.
 
 Si la validación devuelve `requires_review`, el informe humanizado no se sube.
@@ -111,8 +157,9 @@ ni un sistema diagnóstico. Comprueba:
 > No sustituye la valoración de un profesional sanitario ni modifica el informe
 > médico original.
 
-El contenido clínico devuelto por Recog no se modifica; el aviso se añade en una
-portada separada.
+El contenido clínico devuelto por Recog no se modifica. Si el PDF no contiene
+ya el aviso, se añade una única portada separada; los PDFs cacheados que ya lo
+incluyen no reciben otra portada.
 
 ## Outputs
 
