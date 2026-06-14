@@ -32,6 +32,11 @@ DISCLAIMER_TEXT = (
     "No sustituye la valoración de un profesional sanitario ni modifica el "
     "informe médico original."
 )
+PATIENT_NOTICE_TEXT = (
+    "Este documento facilita la comprensión del informe médico original. "
+    "No sustituye la valoración de un profesional sanitario ni modifica el "
+    "informe clínico."
+)
 VALIDATION_NOTE = (
     "Case-specific consistency check for the provided knee MRI demo. "
     "Not a diagnostic validator."
@@ -310,18 +315,55 @@ def contains_any_variant(text, variants):
 
 
 def has_patient_disclaimer(text):
-    """Check for the three essential statements in the patient disclaimer."""
+    """Recognize either supported patient disclaimer wording."""
     normalized = normalize_text(text)
-    return (
+    old_disclaimer = (
         "facilitar la comprension del paciente" in normalized
         and "no sustituye la valoracion de un profesional sanitario" in normalized
         and "ni modifica el informe medico original" in normalized
     )
+    new_disclaimer = (
+        "facilita la comprension del informe medico original" in normalized
+        and "no sustituye la valoracion de un profesional sanitario" in normalized
+        and "ni modifica el informe clinico" in normalized
+    )
+    return old_disclaimer or new_disclaimer
 
 
 def needs_patient_disclaimer(text):
     """Return True only when the patient disclaimer is not already present."""
     return not has_patient_disclaimer(text)
+
+
+def has_new_patient_notice(text):
+    """Return True when text contains the current final-page notice."""
+    normalized = normalize_text(text)
+    return (
+        "aviso importante" in normalized
+        and "facilita la comprension del informe medico original" in normalized
+        and "no sustituye la valoracion de un profesional sanitario" in normalized
+        and "ni modifica el informe clinico" in normalized
+    )
+
+
+def is_legacy_disclaimer_cover(text):
+    """Detect the old disclaimer-only first page without clinical content."""
+    normalized = normalize_text(text)
+    clinical_markers = (
+        "informe resultados",
+        "informe de resultados",
+        "que prueba",
+        "que han visto",
+        "hallazgos",
+        "resonancia",
+        "diagnostico",
+        "conclusion",
+    )
+    return (
+        "informe para paciente" in normalized
+        and "no sustituye la valoracion" in normalized
+        and not any(marker in normalized for marker in clinical_markers)
+    )
 
 
 def validate_humanized_report(original_text: str, humanized_text: str) -> dict:
@@ -563,30 +605,59 @@ def build_raw_recog_output_path():
 
 
 def prepare_patient_report(source_path, output_path=None):
-    """Ensure the patient report contains exactly one added disclaimer cover."""
+    """Normalize legacy covers and keep one patient notice at the end."""
     source_path = Path(source_path)
     if not source_path.is_file():
         raise FileNotFoundError(f"Missing humanized PDF: {source_path}")
 
     output_path = Path(output_path or build_recog_output_path())
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    source_text = extract_text_from_pdf(source_path)
 
-    if not needs_patient_disclaimer(source_text):
+    with fitz.open(source_path) as source_document:
+        if source_document.page_count == 0:
+            raise RuntimeError(f"Humanized PDF has no pages: {source_path}")
+        page_texts = [page.get_text() for page in source_document]
+
+    source_text = "\n".join(page_texts)
+    legacy_cover = (
+        len(page_texts) > 1 and is_legacy_disclaimer_cover(page_texts[0])
+    )
+    has_final_notice = has_new_patient_notice(page_texts[-1])
+
+    if not legacy_cover and (
+        has_final_notice or not needs_patient_disclaimer(source_text)
+    ):
         if source_path.resolve() != output_path.resolve():
             shutil.copyfile(source_path, output_path)
         return output_path
 
     with fitz.open() as final_document:
-        cover = final_document.new_page()
-        cover.insert_textbox(
-            fitz.Rect(72, 90, 523, 300),
-            "INFORME PARA PACIENTE\n\n" + DISCLAIMER_TEXT,
-            fontsize=13,
-            lineheight=1.4,
-        )
         with fitz.open(source_path) as source_document:
-            final_document.insert_pdf(source_document)
+            final_document.insert_pdf(
+                source_document,
+                from_page=1 if legacy_cover else 0,
+            )
+        if not has_final_notice:
+            notice_page = final_document.new_page()
+            notice_page.draw_rect(
+                fitz.Rect(64, 110, 531, 300),
+                color=(0.25, 0.43, 0.58),
+                fill=(0.95, 0.97, 0.99),
+                width=1,
+            )
+            notice_page.insert_textbox(
+                fitz.Rect(88, 140, 507, 185),
+                "Aviso importante",
+                fontsize=16,
+                color=(0.15, 0.31, 0.44),
+            )
+            notice_page.insert_textbox(
+                fitz.Rect(88, 190, 507, 270),
+                PATIENT_NOTICE_TEXT,
+                fontsize=11,
+                lineheight=1.4,
+                color=(0.16, 0.19, 0.22),
+            )
         if output_path.exists():
             output_path.unlink()
         output_path.write_bytes(final_document.tobytes())

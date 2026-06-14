@@ -5,12 +5,26 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import run_full_flow_minimal as flow
 
 
 class DeliveryHardeningTests(unittest.TestCase):
+    @staticmethod
+    def pdf_document_mock(*page_texts):
+        document = MagicMock()
+        document.page_count = len(page_texts)
+        pages = []
+        for text in page_texts:
+            page = Mock()
+            page.get_text.return_value = text
+            pages.append(page)
+        document.__iter__.return_value = iter(pages)
+        document.__enter__.return_value = document
+        document.__exit__.return_value = False
+        return document
+
     def test_dicom_tags_build_common_idonia_route(self):
         context = flow.build_idonia_context(
             {
@@ -200,46 +214,58 @@ class DeliveryHardeningTests(unittest.TestCase):
                 "INFORME PARA PACIENTE\n" + flow.DISCLAIMER_TEXT
             )
         )
+        self.assertFalse(
+            flow.needs_patient_disclaimer(
+                "Aviso importante\n" + flow.PATIENT_NOTICE_TEXT
+            )
+        )
         self.assertTrue(
             flow.needs_patient_disclaimer("Explicación clínica sin aviso.")
         )
 
-    def test_prepare_patient_report_does_not_duplicate_disclaimer(self):
+    def test_has_patient_disclaimer_recognizes_new_wording(self):
+        self.assertTrue(
+            flow.has_patient_disclaimer(
+                "Aviso importante\n" + flow.PATIENT_NOTICE_TEXT
+            )
+        )
+
+    def test_prepare_patient_report_does_not_duplicate_new_final_notice(self):
         source = Path("cached.pdf")
         output = Path("final.pdf")
+        source_document = self.pdf_document_mock(
+            "Contenido clínico.",
+            "Aviso importante\n" + flow.PATIENT_NOTICE_TEXT,
+        )
 
         with patch.object(
             Path,
             "is_file",
             return_value=True,
         ), patch.object(
-            flow,
-            "extract_text_from_pdf",
-            return_value=flow.DISCLAIMER_TEXT,
-        ), patch.object(
             flow.shutil,
             "copyfile",
         ) as copy_mock, patch.object(
             flow.fitz,
             "open",
-            side_effect=AssertionError("must not add another cover"),
+            return_value=source_document,
         ):
             result = flow.prepare_patient_report(source, output)
 
         self.assertEqual(result, output)
         copy_mock.assert_called_once_with(source, output)
 
-    def test_prepare_patient_report_adds_disclaimer_once_when_missing(self):
+    def test_prepare_patient_report_appends_notice_after_clinical_content(self):
         source = Path("cached.pdf")
         output = Path("final.pdf")
-        final_document = Mock()
-        final_document.__enter__ = Mock(return_value=final_document)
-        final_document.__exit__ = Mock(return_value=False)
+        inspected_document = self.pdf_document_mock(
+            "Resonancia de rodilla sin hallazgos."
+        )
+        final_document = MagicMock()
+        final_document.__enter__.return_value = final_document
         final_document.tobytes.return_value = b"%PDF-final"
-        page = final_document.new_page.return_value
-        source_document = Mock()
-        source_document.__enter__ = Mock(return_value=source_document)
-        source_document.__exit__ = Mock(return_value=False)
+        notice_page = final_document.new_page.return_value
+        source_document = self.pdf_document_mock("Contenido clínico.")
 
         with patch.object(
             Path,
@@ -253,21 +279,99 @@ class DeliveryHardeningTests(unittest.TestCase):
             Path,
             "write_bytes",
         ) as write_mock, patch.object(
-            flow,
-            "extract_text_from_pdf",
-            return_value="Resonancia de rodilla sin hallazgos.",
-        ), patch.object(
             flow.fitz,
             "open",
-            side_effect=(final_document, source_document),
+            side_effect=(inspected_document, final_document, source_document),
         ):
             result = flow.prepare_patient_report(source, output)
 
         self.assertEqual(result, output)
+        final_document.insert_pdf.assert_called_once_with(
+            source_document,
+            from_page=0,
+        )
         final_document.new_page.assert_called_once_with()
-        page.insert_textbox.assert_called_once()
-        final_document.insert_pdf.assert_called_once_with(source_document)
+        notice_page.draw_rect.assert_called_once()
+        self.assertEqual(notice_page.insert_textbox.call_count, 2)
+        inserted_text = " ".join(
+            call.args[1] for call in notice_page.insert_textbox.call_args_list
+        )
+        self.assertIn("Aviso importante", inserted_text)
+        self.assertIn(flow.PATIENT_NOTICE_TEXT, inserted_text)
         write_mock.assert_called_once_with(b"%PDF-final")
+
+        method_order = [
+            call[0]
+            for call in final_document.method_calls
+            if call[0] in {"insert_pdf", "new_page"}
+        ]
+        self.assertEqual(method_order, ["insert_pdf", "new_page"])
+
+    def test_prepare_patient_report_replaces_legacy_cover_with_final_notice(self):
+        source = Path("cached.pdf")
+        output = Path("final.pdf")
+        legacy_cover = "INFORME PARA PACIENTE\n" + flow.DISCLAIMER_TEXT
+        inspected_document = self.pdf_document_mock(
+            legacy_cover,
+            "Informe de resultados. Resonancia de rodilla.",
+        )
+        final_document = MagicMock()
+        final_document.__enter__.return_value = final_document
+        final_document.tobytes.return_value = b"%PDF-final"
+        source_document = self.pdf_document_mock(
+            legacy_cover,
+            "Informe de resultados. Resonancia de rodilla.",
+        )
+
+        with patch.object(
+            Path,
+            "is_file",
+            return_value=True,
+        ), patch.object(
+            Path,
+            "exists",
+            return_value=False,
+        ), patch.object(
+            Path,
+            "write_bytes",
+        ), patch.object(
+            flow.fitz,
+            "open",
+            side_effect=(inspected_document, final_document, source_document),
+        ):
+            flow.prepare_patient_report(source, output)
+
+        final_document.insert_pdf.assert_called_once_with(
+            source_document,
+            from_page=1,
+        )
+        final_document.new_page.assert_called_once_with()
+
+    def test_prepare_patient_report_keeps_clinical_first_page(self):
+        source = Path("cached.pdf")
+        output = Path("final.pdf")
+        clinical_first_page = (
+            "INFORME PARA PACIENTE\n"
+            + flow.DISCLAIMER_TEXT
+            + "\nInforme de resultados. Resonancia de rodilla."
+        )
+        inspected_document = self.pdf_document_mock(clinical_first_page)
+
+        with patch.object(
+            Path,
+            "is_file",
+            return_value=True,
+        ), patch.object(
+            flow.shutil,
+            "copyfile",
+        ) as copy_mock, patch.object(
+            flow.fitz,
+            "open",
+            return_value=inspected_document,
+        ):
+            flow.prepare_patient_report(source, output)
+
+        copy_mock.assert_called_once_with(source, output)
 
     def test_validation_preserves_meniscus_across_plural(self):
         original = "La resonancia de rodilla muestra el menisco conservado."

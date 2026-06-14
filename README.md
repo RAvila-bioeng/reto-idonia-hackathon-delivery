@@ -162,9 +162,11 @@ ni un sistema diagnóstico. Comprueba:
 > No sustituye la valoración de un profesional sanitario ni modifica el informe
 > médico original.
 
-El contenido clínico devuelto por Recog no se modifica. Si el PDF no contiene
-ya el aviso, se añade una única portada separada; los PDFs cacheados que ya lo
-incluyen no reciben otra portada.
+El contenido clínico y las páginas devueltas por Recog no se modifican. Si el
+PDF no contiene ya el aviso, se añade una única página final con un bloque
+visual discreto; los PDFs cacheados que ya lo incluyen no reciben otra página.
+Las portadas antiguas que solo contenían el disclaimer se eliminan y se
+reemplazan por este aviso final, sin modificar las páginas clínicas.
 
 Si el resultado es `requires_review`, la subida del informe humanizado queda
 bloqueada por defecto. `--allow-requires-review-upload` solo debe utilizarse
