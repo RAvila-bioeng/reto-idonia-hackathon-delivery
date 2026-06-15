@@ -189,7 +189,7 @@ ni repositorios públicos.
 ## Verificación local
 
 ```powershell
-python -m compileall run_full_flow_minimal.py tests
+python -m compileall run_full_flow_minimal.py tests docs/generate_memoria_pdf.py
 python -m unittest discover -s tests -v
 ```
 
@@ -205,7 +205,7 @@ python -m unittest discover -s tests -v
 
 ## Estado verificado
 
-- Tests locales: 22/22 correctos.
+- Tests locales: 25/25 correctos (15 de junio de 2026).
 - Contexto Idonia derivado desde los tags DICOM.
 - Informe original, estudio DICOM e informe humanizado aceptados por Idonia con
   HTTP 201.
